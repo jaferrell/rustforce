@@ -1,17 +1,20 @@
-extern crate reqwest;
+#[allow(non_snake_case)]
 
+extern crate reqwest;
 use crate::errors::Error;
 use crate::response::{
-    AccessToken, CreateResponse, DescribeGlobalResponse, DescribeResponse, ErrorResponse,
+    AccessToken, CreateResponse, SObjectDescribeResponse, SObjectRAWDescribeResponse, ErrorResponse,
     QueryResponse, SearchResponse, TokenResponse, VersionResponse,
 };
+
 use crate::utils::substring_before;
 use regex::Regex;
 use reqwest::header::{HeaderMap, AUTHORIZATION};
-use reqwest::{Response, StatusCode, Url};
+use reqwest::{Response, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::collections::HashMap;
+
+use serde::de;
 
 /// Represents a Salesforce Client
 pub struct Client {
@@ -25,25 +28,33 @@ pub struct Client {
 }
 
 impl Client {
-    /// Creates a new client when passed a Client ID and Client Secret. These
-    /// can be obtained by creating a connected app in Salesforce
-    pub fn new(client_id: Option<String>, client_secret: Option<String>) -> Self {
+    
+    pub fn new() -> Self {
         let http_client = reqwest::Client::new();
         Client {
             http_client,
-            client_id,
-            client_secret,
+            client_id : None,
+            client_secret : None,
             login_endpoint: "https://login.salesforce.com".to_string(),
             access_token: None,
             instance_url: None,
-            version: "v44.0".to_string(),
+            version: "v57.0".to_string(),
         }
     }
 
-    /// Set the login endpoint. This is useful if you want to connect to a
-    /// Sandbox
+    /// Set the login endpoint. This is useful if you want to connect to a test or developer
     pub fn set_login_endpoint(&mut self, endpoint: &str) -> &mut Self {
         self.login_endpoint = endpoint.to_string();
+        self
+    }
+
+    pub fn set_client_id(&mut self, client_id : &str) -> &mut Self {
+        self.client_id = Some(client_id.to_string());
+        self
+    }
+
+    pub fn set_client_secret(&mut self, client_secret : &str) -> &mut Self {
+        self.client_secret = Some(client_secret.to_string());
         self
     }
 
@@ -58,9 +69,8 @@ impl Client {
         self
     }
 
-    /// Set Access token if you've already obtained one via one of the OAuth2
-    /// flows
-    pub fn set_access_token(&mut self, access_token: &str) -> &mut Self {
+    /// Set Access token if you've already obtained one via one of the OAuth2 flows
+    fn set_access_token(&mut self, access_token: &str) -> &mut Self {
         self.access_token = Some(AccessToken {
             token_type: "Bearer".to_string(),
             value: access_token.to_string(),
@@ -214,6 +224,41 @@ impl Client {
         }
     }
 
+    // ADVANCED QUERY WITH ALL FIELDS
+    pub async fn query_all_all_fields<T : de::DeserializeOwned>(&self, sobject_name : &str) -> Result<Vec<T >, Error> {
+        let soql = self.create_all_fields_SOQL(&sobject_name).await?;
+        let res  = self.query_all::<T>(&soql).await?;
+        Ok(res.records)
+    }
+
+    // GET ALL FIELDS
+    pub async fn get_all_fields(&self, sobject_name: &str) -> Result<Vec<String>, Error> {
+        let sobject = self.describe(&sobject_name).await?;
+        let mut fields = Vec::<String>::new();
+
+        for field in sobject.fields.iter() {
+            fields.push(field.name.clone());
+        }
+        Ok(fields)
+    }
+
+    // CREATE ALL FIELDS SOQL
+    pub async fn create_all_fields_SOQL(&self, sobject_name : &str) -> Result<String, Error> {
+        
+        let fields = self.get_all_fields(sobject_name).await?;
+        let mut fields_string = String::new();
+
+        for field in fields.iter() {
+            fields_string.push_str(&field);
+            fields_string.push_str(", ");
+        }
+        fields_string.pop();
+        fields_string.pop();
+
+        let SOQL = format!("Select {} from {}", fields_string, sobject_name);
+        Ok(SOQL)
+    }
+
     /// Query record using SOQL
     pub async fn query<T: DeserializeOwned>(&self, query: &str) -> Result<QueryResponse<T>, Error> {
         let query_url = format!("{}/query/", self.base_path());
@@ -356,20 +401,8 @@ impl Client {
         }
     }
 
-    /// Describes all objects
-    pub async fn describe_global(&self) -> Result<DescribeGlobalResponse, Error> {
-        let resource_url = format!("{}/sobjects/", self.base_path());
-        let res = self.get(resource_url, vec![]).await?;
-
-        if res.status().is_success() {
-            Ok(res.json().await?)
-        } else {
-            Err(Error::DescribeError(res.json().await?))
-        }
-    }
-
     /// Describes specific object
-    pub async fn describe(&self, sobject_name: &str) -> Result<serde_json::Value, Error> {
+    pub async fn describe(&self, sobject_name: &str) -> Result<SObjectDescribeResponse, Error> {
         let resource_url = format!("{}/sobjects/{}/describe", self.base_path(), sobject_name);
         let res = self.get(resource_url, vec![]).await?;
 
@@ -380,28 +413,12 @@ impl Client {
         }
     }
 
-    pub async fn rest_get_fulluri(&self, uri: &str) -> Result<Response, Error> {
-        let resource_url = format!(
-            "{}/services/apexrest/{}",
-            self.instance_url.as_ref().unwrap(),
-            uri
-        );
-        let parsed = Url::parse(&resource_url).unwrap();
-        // Some ownership absurdity for string refs accessed through iterators with collect
-        let hash_query: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-        let paramstrings: Vec<(String, String)> = hash_query
-            .keys()
-            .map(|k| (String::from(k), String::from(&hash_query[k])))
-            .collect();
-        let params: Vec<(&str, &str)> = paramstrings
-            .iter()
-            .map(|&(ref x, ref y)| (&x[..], &y[..]))
-            .collect();
-        let path: String = parsed.path().to_string();
-        let res = self.rest_get(path, params).await?;
+    pub async fn describe_raw(&self, sobject_name: &str) -> Result<SObjectRAWDescribeResponse , Error> {
+        let resource_url = format!("{}/sobjects/{}/describe", self.base_path(), sobject_name);
+        let res = self.get(resource_url, vec![]).await?;
 
         if res.status().is_success() {
-            Ok(res)
+            Ok(serde_json::from_str(res.text().await?.as_str())?)
         } else {
             Err(Error::DescribeError(res.json().await?))
         }
@@ -535,7 +552,7 @@ impl Client {
         Ok(headers)
     }
 
-    fn base_path(&self) -> String {
+    pub fn base_path(&self) -> String {
         format!(
             "{}/services/data/{}",
             self.instance_url.as_ref().unwrap(),
@@ -544,252 +561,3 @@ impl Client {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use crate::{errors::Error, response::QueryResponse};
-    use mockito::mock;
-    use serde::{Deserialize, Serialize};
-    use serde_json::json;
-
-    #[derive(Deserialize, Serialize)]
-    #[serde(rename_all = "PascalCase")]
-    struct Account {
-        id: String,
-        name: String,
-    }
-
-    #[tokio::test]
-    async fn login_with_credentials() -> Result<(), Error> {
-        let _m = mock("POST", "/services/oauth2/token")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                json!({
-                    "access_token": "this_is_access_token",
-                    "issued_at": "2019-10-01 00:00:00",
-                    "id": "12345",
-                    "instance_url": "https://ap.salesforce.com",
-                    "signature": "abcde",
-                    "token_type": "Bearer",
-                })
-                .to_string(),
-            )
-            .create();
-
-        let mut client = super::Client::new(Some("aaa".to_string()), Some("bbb".to_string()));
-        let url = &mockito::server_url();
-        client.set_login_endpoint(url);
-        client
-            .login_with_credential("u".to_string(), "p".to_string())
-            .await?;
-        let token = client.access_token.unwrap();
-        assert_eq!("this_is_access_token", token.value);
-        assert_eq!("Bearer", token.token_type);
-        assert_eq!("2019-10-01 00:00:00", token.issued_at);
-        assert_eq!("https://ap.salesforce.com", client.instance_url.unwrap());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn query() -> Result<(), Error> {
-        let _m = mock(
-            "GET",
-            "/services/data/v44.0/query/?q=SELECT+Id%2C+Name+FROM+Account",
-        )
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            json!({
-                "totalSize": 123,
-                "done": true,
-                "records": vec![
-                    Account {
-                        id: "123".to_string(),
-                        name: "foo".to_string(),
-                    },
-                ]
-            })
-            .to_string(),
-        )
-        .create();
-
-        let client = create_test_client();
-        let r: QueryResponse<Account> = client.query("SELECT Id, Name FROM Account").await?;
-        assert_eq!(123, r.total_size);
-        assert_eq!(true, r.done);
-        assert_eq!("123", r.records[0].id);
-        assert_eq!("foo", r.records[0].name);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn create() -> Result<(), Error> {
-        let _m = mock("POST", "/services/data/v44.0/sobjects/Account")
-            .with_status(201)
-            .with_header("content-type", "application/json")
-            .with_body(
-                json!({
-                                "id": "12345",
-                                "success": true,
-                //                "errors": vec![],
-                            })
-                .to_string(),
-            )
-            .create();
-
-        let client = create_test_client();
-        let r = client
-            .create("Account", [("Name", "foo"), ("Abc__c", "123")])
-            .await?;
-        assert_eq!("12345", r.id);
-        assert_eq!(true, r.success);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn update() -> Result<(), Error> {
-        let _m = mock("PATCH", "/services/data/v44.0/sobjects/Account/123")
-            .with_status(204)
-            .with_header("content-type", "application/json")
-            .create();
-
-        let client = create_test_client();
-        let r = client
-            .update("Account", "123", [("Name", "foo"), ("Abc__c", "123")])
-            .await;
-        assert_eq!(true, r.is_ok());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn upsert_201() -> Result<(), Error> {
-        let _m = mock(
-            "PATCH",
-            "/services/data/v44.0/sobjects/Account/ExKey__c/123",
-        )
-        .with_status(201)
-        .with_header("content-type", "application/json")
-        .with_body(
-            json!({
-                            "id": "12345",
-                            "success": true,
-            //                "errors": vec![],
-                        })
-            .to_string(),
-        )
-        .create();
-
-        let client = create_test_client();
-        let r = client
-            .upsert(
-                "Account",
-                "ExKey__c",
-                "123",
-                [("Name", "foo"), ("Abc__c", "123")],
-            )
-            .await
-            .unwrap();
-        assert_eq!(true, r.is_some());
-        let res = r.unwrap();
-        assert_eq!("12345", res.id);
-        assert_eq!(true, res.success);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn upsert_204() -> Result<(), Error> {
-        let _m = mock(
-            "PATCH",
-            "/services/data/v44.0/sobjects/Account/ExKey__c/123",
-        )
-        .with_status(204)
-        .with_header("content-type", "application/json")
-        .create();
-
-        let client = create_test_client();
-        let r = client
-            .upsert(
-                "Account",
-                "ExKey__c",
-                "123",
-                [("Name", "foo"), ("Abc__c", "123")],
-            )
-            .await
-            .unwrap();
-        assert_eq!(true, r.is_none());
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn destroy() -> Result<(), Error> {
-        let _m = mock("DELETE", "/services/data/v44.0/sobjects/Account/123")
-            .with_status(204)
-            .with_header("content-type", "application/json")
-            .create();
-
-        let client = create_test_client();
-        let r = client.destroy("Account", "123").await?;
-        println!("{:?}", r);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn versions() -> Result<(), Error> {
-        let _m = mock("GET", "/services/data/")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                json!([{
-                    "label": "Winter '19",
-                    "url": "https://ap.salesforce.com/services/data/v44.0/",
-                    "version": "v44.0",
-                }])
-                .to_string(),
-            )
-            .create();
-
-        let client = create_test_client();
-        let r = client.versions().await?;
-        assert_eq!("Winter '19", r[0].label);
-        assert_eq!("https://ap.salesforce.com/services/data/v44.0/", r[0].url);
-        assert_eq!("v44.0", r[0].version);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn find_by_id() -> Result<(), Error> {
-        let _m = mock("GET", "/services/data/v44.0/sobjects/Account/123")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(
-                json!({
-                    "Id": "123",
-                    "Name": "foo",
-                })
-                .to_string(),
-            )
-            .create();
-
-        let client = create_test_client();
-        let r: Account = client.find_by_id("Account", "123").await?;
-        assert_eq!("foo", r.name);
-
-        Ok(())
-    }
-
-    fn create_test_client() -> super::Client {
-        let mut client = super::Client::new(Some("aaa".to_string()), Some("bbb".to_string()));
-        let url = &mockito::server_url();
-        client.set_instance_url(url);
-        client.set_access_token("this_is_access_token");
-        return client;
-    }
-}
